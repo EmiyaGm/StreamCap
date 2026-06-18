@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -578,6 +579,43 @@ class LiveStreamRecorder:
             return save_file_path.rsplit(".", maxsplit=1)[0] + ".mp4"
         return save_file_path
 
+    @staticmethod
+    def _build_script_argv(
+        script_command: str,
+        record_name: str,
+        save_file_path: str,
+        save_type: str,
+        split_video_by_time: bool,
+        converts_to_mp4: bool,
+    ) -> list[str]:
+        argv = shlex.split(script_command.strip(), posix=sys.platform != "win32")
+        if "python" in script_command.lower():
+            argv.extend(
+                [
+                    "--record_name",
+                    record_name,
+                    "--save_file_path",
+                    save_file_path,
+                    "--save_type",
+                    save_type,
+                    "--split_video_by_time",
+                    str(split_video_by_time),
+                    "--converts_to_mp4",
+                    str(converts_to_mp4),
+                ]
+            )
+        else:
+            argv.extend(
+                [
+                    record_name.split(" ", maxsplit=1)[-1],
+                    save_file_path,
+                    save_type,
+                    f"split_video_by_time: {split_video_by_time}",
+                    f"converts_to_mp4: {converts_to_mp4}",
+                ]
+            )
+        return argv
+
     async def custom_script_execute(
         self,
         script_command: str,
@@ -590,39 +628,29 @@ class LiveStreamRecorder:
         from ..runtime.process_manager import BackgroundService
 
         save_file_path = self._resolve_script_save_file_path(save_file_path, save_type, converts_to_mp4)
-
-        if "python" in script_command:
-            params = [
-                f'--record_name "{record_name}"',
-                f'--save_file_path "{save_file_path}"',
-                f"--save_type {save_type}",
-                f"--split_video_by_time {split_video_by_time}",
-                f"--converts_to_mp4 {converts_to_mp4}",
-            ]
-        else:
-            params = [
-                f'"{record_name.split(" ", maxsplit=1)[-1]}"',
-                f'"{save_file_path}"',
-                save_type,
-                f"split_video_by_time: {split_video_by_time}",
-                f"converts_to_mp4: {converts_to_mp4}",
-            ]
-        script_command = script_command.strip() + " " + " ".join(params)
+        script_argv = self._build_script_argv(
+            script_command,
+            record_name,
+            save_file_path,
+            save_type,
+            split_video_by_time,
+            converts_to_mp4,
+        )
 
         if not self.services.recording_enabled:
             logger.info("Application is closing, adding script execution task to background service")
-            BackgroundService.get_instance().add_task(self.run_script_sync, script_command)
+            BackgroundService.get_instance().add_task(self.run_script_sync, script_argv)
         else:
-            await self.run_script_async(script_command)
+            await self.run_script_async(script_argv)
 
         logger.success("Script command execution initiated!")
 
-    def run_script_sync(self, command: str) -> None:
+    def run_script_sync(self, script_argv: list[str]) -> None:
         """Synchronous version of the script execution method, used for background service"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self.run_script_async(command))
+            loop.run_until_complete(self.run_script_async(script_argv))
         finally:
             loop.close()
 
@@ -639,15 +667,15 @@ class LiveStreamRecorder:
             if text:
                 log_func(f"[custom_script] {text}")
 
-    async def run_script_async(self, command: str) -> None:
-        logger.info(f"Executing custom script command: {command}")
+    async def run_script_async(self, script_argv: list[str]) -> None:
+        logger.info(f"Executing custom script command: {shlex.join(script_argv)}")
         try:
             env = utils.prepare_subprocess_env()
-            if "python" in command.lower():
+            if any("python" in part.lower() for part in script_argv[:2]):
                 env["PYTHONUNBUFFERED"] = "1"
 
             process = await asyncio.create_subprocess_exec(
-                *command.split(),
+                *script_argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 startupinfo=self.subprocess_start_info,
