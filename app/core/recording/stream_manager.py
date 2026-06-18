@@ -635,14 +635,14 @@ class LiveStreamRecorder:
             line = await stream.readline()
             if not line:
                 break
-            text = line.decode(errors="replace").rstrip()
+            text = utils.decode_subprocess_output(line).rstrip()
             if text:
                 log_func(f"[custom_script] {text}")
 
     async def run_script_async(self, command: str) -> None:
         logger.info(f"Executing custom script command: {command}")
         try:
-            env = os.environ.copy()
+            env = utils.prepare_subprocess_env()
             if "python" in command.lower():
                 env["PYTHONUNBUFFERED"] = "1"
 

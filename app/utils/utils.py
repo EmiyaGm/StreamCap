@@ -2,6 +2,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import locale
 import os
 import random
 import re
@@ -269,6 +270,41 @@ def contains_url(text):
         return bool(CONTAINS_URL_PATTERN.search(text))
     except ValueError:
         return False
+
+
+def decode_subprocess_output(data: bytes) -> str:
+    """Decode subprocess stdout/stderr, handling Windows GBK console output."""
+    if not data:
+        return ""
+
+    encodings = ["utf-8"]
+    if sys.platform == "win32":
+        preferred = locale.getpreferredencoding(False)
+        if preferred and preferred.lower() not in ("utf-8", "utf8"):
+            encodings.append(preferred)
+        encodings.extend(["gbk", "cp936"])
+
+    seen: set[str] = set()
+    for encoding in encodings:
+        key = encoding.lower().replace("-", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("utf-8", errors="replace")
+
+
+def prepare_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a subprocess environment with Windows-friendly UTF-8 defaults."""
+    prepared = (env or os.environ).copy()
+    if sys.platform == "win32":
+        prepared.setdefault("PYTHONIOENCODING", "utf-8")
+        prepared.setdefault("PYTHONUTF8", "1")
+    return prepared
 
 
 def get_startup_info(system_type: str | None = None):
