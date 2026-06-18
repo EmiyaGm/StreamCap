@@ -438,50 +438,13 @@ class LiveStreamRecorder:
                 if not self.recording.manually_stopped:
                     await self.recheck_live_status()
 
-                if self.user_config.get("convert_to_mp4") and self.save_format == "ts":
-                    if self.segment_record:
-                        file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
-                        prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
-                        for path in file_paths:
-                            if prefix in path:
-                                try:
-                                    self.services.run_coro(self.converts_mp4(path, self.user_config["delete_original"]))
-                                except Exception as e:
-                                    logger.error(f"Failed to convert video: {e}")
-                                    await self.converts_mp4(path, self.user_config["delete_original"])
-                    else:
-                        try:
-                            self.services.run_coro(
-                                self.converts_mp4(save_file_path, self.user_config["delete_original"])
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to convert video: {e}")
-                            await self.converts_mp4(save_file_path, self.user_config["delete_original"])
-
-                if self.user_config.get("execute_custom_script") and script_command:
-                    logger.info("Prepare a direct script in the background")
-                    try:
-                        self.services.run_coro(
-                            self.custom_script_execute(
-                                script_command,
-                                record_name,
-                                save_file_path,
-                                save_type,
-                                self.segment_record,
-                                self.user_config.get("convert_to_mp4"),
-                            )
-                        )
-                        logger.success("Successfully added script execution")
-                    except Exception as e:
-                        logger.error(f"Failed to execute custom script: {e}")
-                        await self.custom_script_execute(
-                            script_command,
-                            record_name,
-                            save_file_path,
-                            save_type,
-                            self.segment_record,
-                            self.user_config.get("convert_to_mp4"),
-                        )
+                await self._post_recording_processing(
+                    save_file_path,
+                    script_command,
+                    record_name,
+                    save_type,
+                    self.segment_record,
+                )
 
         except Exception as e:
             logger.error(f"An error occurred during the subprocess execution: {e}")
@@ -571,6 +534,50 @@ class LiveStreamRecorder:
         except Exception as e:
             logger.error(f"An unknown error occurred: {e}")
 
+    async def _convert_recorded_files(self, save_file_path: str) -> None:
+        if not (self.user_config.get("convert_to_mp4") and self.save_format == "ts"):
+            return
+
+        delete_original = self.user_config["delete_original"]
+        if self.segment_record:
+            file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
+            prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
+            for path in file_paths:
+                if prefix in path:
+                    await self.converts_mp4(path, delete_original)
+        else:
+            await self.converts_mp4(save_file_path, delete_original)
+
+    async def _post_recording_processing(
+        self,
+        save_file_path: str,
+        script_command: str | None,
+        record_name: str,
+        save_type: str,
+        split_video_by_time: bool,
+    ) -> None:
+        await self._convert_recorded_files(save_file_path)
+
+        if not (self.user_config.get("execute_custom_script") and script_command):
+            return
+
+        logger.info("Prepare to execute custom script after post-processing")
+        await self.custom_script_execute(
+            script_command,
+            record_name,
+            save_file_path,
+            save_type,
+            split_video_by_time,
+            self.user_config.get("convert_to_mp4"),
+        )
+        logger.success("Successfully completed script execution")
+
+    @staticmethod
+    def _resolve_script_save_file_path(save_file_path: str, save_type: str, converts_to_mp4: bool) -> str:
+        if converts_to_mp4 and save_type == "ts" and "." in save_file_path:
+            return save_file_path.rsplit(".", maxsplit=1)[0] + ".mp4"
+        return save_file_path
+
     async def custom_script_execute(
         self,
         script_command: str,
@@ -581,6 +588,8 @@ class LiveStreamRecorder:
         converts_to_mp4: bool,
     ):
         from ..runtime.process_manager import BackgroundService
+
+        save_file_path = self._resolve_script_save_file_path(save_file_path, save_type, converts_to_mp4)
 
         if "python" in script_command:
             params = [
@@ -604,7 +613,7 @@ class LiveStreamRecorder:
             logger.info("Application is closing, adding script execution task to background service")
             BackgroundService.get_instance().add_task(self.run_script_sync, script_command)
         else:
-            self.services.run_coro(self.run_script_async(script_command))
+            await self.run_script_async(script_command)
 
         logger.success("Script command execution initiated!")
 
@@ -617,25 +626,44 @@ class LiveStreamRecorder:
         finally:
             loop.close()
 
+    async def _log_script_stream(self, stream: asyncio.StreamReader | None, level: str) -> None:
+        if stream is None:
+            return
+
+        log_func = logger.error if level == "stderr" else logger.info
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").rstrip()
+            if text:
+                log_func(f"[custom_script] {text}")
+
     async def run_script_async(self, command: str) -> None:
+        logger.info(f"Executing custom script command: {command}")
         try:
+            env = os.environ.copy()
+            if "python" in command.lower():
+                env["PYTHONUNBUFFERED"] = "1"
+
             process = await asyncio.create_subprocess_exec(
                 *command.split(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 startupinfo=self.subprocess_start_info,
-                text=False,
+                env=env,
             )
 
-            stdout, stderr = await process.communicate()
+            await asyncio.gather(
+                self._log_script_stream(process.stdout, "stdout"),
+                self._log_script_stream(process.stderr, "stderr"),
+            )
 
-            if stdout:
-                logger.info(stdout.splitlines()[0].decode())
-            if stderr:
-                logger.error(stderr.splitlines()[0].decode())
-
-            if process.returncode != 0:
-                logger.info(f"Custom Script process exited with return code {process.returncode}")
+            return_code = await process.wait()
+            if return_code != 0:
+                logger.error(f"Custom script exited with return code {return_code}")
+            else:
+                logger.success("Custom script completed successfully")
 
         except PermissionError:
             logger.error(
@@ -719,25 +747,13 @@ class LiveStreamRecorder:
 
             await self.recheck_live_status()
 
-            if self.user_config.get("execute_custom_script") and script_command:
-                logger.info("Prepare to execute custom script in the background")
-                try:
-                    self.services.run_coro(
-                        self.custom_script_execute(
-                            script_command,
-                            record_name,
-                            save_file_path,
-                            save_type,
-                            False,
-                            False,
-                        )
-                    )
-                    logger.success("Successfully added script execution")
-                except Exception as e:
-                    logger.error(f"Failed to execute custom script: {e}")
-                    await self.custom_script_execute(
-                        script_command, record_name, save_file_path, save_type, False, False
-                    )
+            await self._post_recording_processing(
+                save_file_path,
+                script_command,
+                record_name,
+                save_type,
+                False,
+            )
 
             return True
 
