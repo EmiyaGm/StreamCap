@@ -584,87 +584,6 @@ class LiveStreamRecorder:
         )
         logger.success("Successfully completed script execution")
 
-    async def _delete_file_after_script(self, file_path: str, record_name: str = "") -> None:
-        """自定义脚本结束后，由 StreamCap 删除本地成品（及同场次残留）。"""
-        if not file_path:
-            return
-
-        deleted_main = False
-        if os.path.isfile(file_path):
-            for attempt in range(1, 11):
-                try:
-                    os.remove(file_path)
-                    deleted_main = True
-                    logger.info(f"Deleted local file after custom script: {file_path}")
-                    break
-                except OSError as e:
-                    if attempt >= 10:
-                        logger.error(f"Failed to delete local file after custom script: {file_path} ({e})")
-                    else:
-                        await asyncio.sleep(min(1.5 * attempt, 8))
-        else:
-            deleted_main = True
-            logger.debug(f"Local file already gone after custom script: {file_path}")
-
-        if not deleted_main:
-            return
-
-        # 清理 original/ 中同名中间文件，以及同场次残留片段
-        await asyncio.to_thread(self._cleanup_session_leftovers, file_path, record_name)
-
-    @staticmethod
-    def _cleanup_session_leftovers(file_path: str, record_name: str = "") -> None:
-        parent_dir = os.path.dirname(file_path)
-        stem = os.path.splitext(os.path.basename(file_path))[0]
-        record_name = (record_name or os.path.basename(parent_dir)).strip()
-
-        candidates: list[str] = []
-        original_dir = os.path.join(parent_dir, "original")
-        for directory in (parent_dir, original_dir):
-            if not os.path.isdir(directory):
-                continue
-            try:
-                names = os.listdir(directory)
-            except OSError:
-                continue
-            for name in names:
-                path = os.path.join(directory, name)
-                if not os.path.isfile(path):
-                    continue
-                name_stem, ext = os.path.splitext(name)
-                if ext.lower() not in {".mp4", ".ts", ".mkv", ".flv", ".m4a", ".mov", ".webm"}:
-                    continue
-                if name_stem == stem or name_stem.startswith(f"{stem}_"):
-                    candidates.append(path)
-                elif record_name:
-                    # 同录播名 + 同日期的其他片段：{record_name}_{YYYY-MM-DD}_...
-                    prefix = f"{record_name}_"
-                    if name_stem.startswith(prefix):
-                        date_part = name_stem[len(prefix) :].split("_", 1)[0]
-                        ref_prefix = f"{prefix}{date_part}"
-                        if stem.startswith(ref_prefix) and name_stem.startswith(f"{ref_prefix}_"):
-                            candidates.append(path)
-
-        for path in sorted(set(candidates)):
-            for attempt in range(1, 6):
-                try:
-                    os.remove(path)
-                    logger.info(f"Deleted leftover segment after custom script: {path}")
-                    break
-                except OSError as e:
-                    if attempt >= 5:
-                        logger.warning(f"Failed to delete leftover segment: {path} ({e})")
-                    else:
-                        time.sleep(min(1.0 * attempt, 5))
-
-        if os.path.isdir(original_dir):
-            try:
-                if not os.listdir(original_dir):
-                    os.rmdir(original_dir)
-                    logger.info(f"Removed empty original dir: {original_dir}")
-            except OSError:
-                pass
-
     @staticmethod
     def _resolve_script_save_file_path(save_file_path: str, save_type: str, converts_to_mp4: bool) -> str:
         if converts_to_mp4 and save_type == "ts" and "." in save_file_path:
@@ -731,33 +650,18 @@ class LiveStreamRecorder:
 
         if not self.services.recording_enabled:
             logger.info("Application is closing, adding script execution task to background service")
-            BackgroundService.get_instance().add_task(
-                self.run_script_sync, script_argv, save_file_path, record_name
-            )
+            BackgroundService.get_instance().add_task(self.run_script_sync, script_argv)
         else:
-            script_ok = await self.run_script_async(script_argv)
-            # 仅在脚本退出码为 0（上传+注册成功）时，由父进程删除本地文件
-            if script_ok:
-                await self._delete_file_after_script(save_file_path, record_name)
-            else:
-                logger.warning(
-                    f"Custom script failed; keep local file for retry: {save_file_path}"
-                )
+            await self.run_script_async(script_argv)
 
         logger.success("Script command execution initiated!")
 
-    def run_script_sync(self, script_argv: list[str], save_file_path: str = "", record_name: str = "") -> None:
+    def run_script_sync(self, script_argv: list[str]) -> None:
         """Synchronous version of the script execution method, used for background service"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            script_ok = loop.run_until_complete(self.run_script_async(script_argv))
-            if script_ok and save_file_path:
-                loop.run_until_complete(self._delete_file_after_script(save_file_path, record_name))
-            elif save_file_path and not script_ok:
-                logger.warning(
-                    f"Custom script failed in background; keep local file for retry: {save_file_path}"
-                )
+            loop.run_until_complete(self.run_script_async(script_argv))
         finally:
             loop.close()
 
@@ -774,15 +678,13 @@ class LiveStreamRecorder:
             if text:
                 log_func(f"[custom_script] {text}")
 
-    async def run_script_async(self, script_argv: list[str]) -> bool:
-        """执行自定义脚本。返回 True 表示进程退出码为 0（约定为上传成功）。"""
+    async def run_script_async(self, script_argv: list[str]) -> None:
+        """执行自定义脚本（上传、注册、本地删除均由脚本自行完成）。"""
         logger.info(f"Executing custom script command: {shlex.join(script_argv)}")
         try:
             env = utils.prepare_subprocess_env()
             if any("python" in part.lower() for part in script_argv[:2]):
                 env["PYTHONUNBUFFERED"] = "1"
-            # 告知上传脚本：本地文件由 StreamCap 在脚本成功结束后删除
-            env["STREAMCAP_PARENT_DELETE"] = "1"
 
             process = await asyncio.create_subprocess_exec(
                 *script_argv,
@@ -800,23 +702,18 @@ class LiveStreamRecorder:
             return_code = await process.wait()
             if return_code != 0:
                 logger.error(f"Custom script exited with return code {return_code}")
-                return False
-
-            logger.success("Custom script completed successfully")
-            return True
+            else:
+                logger.success("Custom script completed successfully")
 
         except PermissionError:
             logger.error(
                 "Script has no execution permission!, If it is a Linux environment, "
                 "please first execute: chmod+x your_script.sh to grant script executable permission"
             )
-            return False
         except OSError:
             logger.error("Please add `#!/bin/bash` at the beginning of your bash script file.")
-            return False
         except Exception as e:
             logger.error(f"An error occurred: {e}")
-            return False
 
     @staticmethod
     def get_headers_params(live_url, platform_key):
